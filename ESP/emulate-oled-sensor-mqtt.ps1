@@ -16,15 +16,22 @@
 .PARAMETER Broker
   ThingsBoard server host/IP. Matches tbServer in the .ino.
 
+.PARAMETER DurationSeconds
+  How long to stream for, then stop on its own. 0 = run forever (Ctrl+C to stop).
+
 .EXAMPLE
   .\emulate-oled-sensor-mqtt.ps1 -Token "A1B2C3D4E5F6G7H8I9J0"
+.EXAMPLE
+  # Publish a changing value every 2s for 10s, then stop (5 publishes)
+  .\emulate-oled-sensor-mqtt.ps1 -Token "A1B2C3D4E5F6G7H8I9J0" -DurationSeconds 10
 #>
 param(
     [Parameter(Mandatory = $true)]
     [string]$Token,
     [string]$Broker = "192.168.100.223",
     [int]$Port = 1883,
-    [double]$IntervalSeconds = 2.0
+    [double]$IntervalSeconds = 2.0,
+    [double]$DurationSeconds = 0
 )
 
 $ErrorActionPreference = "Stop"
@@ -42,7 +49,13 @@ function Invoke-MqttPub {
     & docker @dockerArgs
 }
 
-Write-Host "Streaming simulated telemetry to ThingsBoard at ${Broker}:${Port} every $IntervalSeconds s. Ctrl+C to stop." -ForegroundColor Cyan
+if ($DurationSeconds -gt 0) {
+    $iterations = [Math]::Max(1, [Math]::Floor($DurationSeconds / $IntervalSeconds))
+    Write-Host "Streaming simulated telemetry to ThingsBoard at ${Broker}:${Port} every $IntervalSeconds s, for $DurationSeconds s ($iterations publishes)." -ForegroundColor Cyan
+} else {
+    $iterations = [double]::PositiveInfinity
+    Write-Host "Streaming simulated telemetry to ThingsBoard at ${Broker}:${Port} every $IntervalSeconds s. Ctrl+C to stop." -ForegroundColor Cyan
+}
 Write-Host "(Device identified by its access token -- make sure a device with that token exists in ThingsBoard.)" -ForegroundColor Cyan
 Write-Host ""
 
@@ -53,7 +66,9 @@ $mqVoltage   = 0.8
 $touchOn     = $false
 $rand        = [System.Random]::new()
 
-while ($true) {
+$i = 0
+while ($i -lt $iterations) {
+    $i++
     # Slow random walk, clamped to plausible indoor ranges (mirrors TEMP_MIN_C/TEMP_MAX_C
     # and the DHT11/MQ-135 behavior in the firmware).
     $temperature += ($rand.NextDouble() - 0.5) * 0.4
@@ -83,5 +98,11 @@ while ($true) {
     Invoke-MqttPub -Topic "v1/devices/me/telemetry" -Message $payload
     Write-Host ("[{0:T}] {1}" -f (Get-Date), $payload)
 
-    Start-Sleep -Seconds $IntervalSeconds
+    if ($i -lt $iterations) {
+        Start-Sleep -Seconds $IntervalSeconds
+    }
+}
+
+if ($DurationSeconds -gt 0) {
+    Write-Host "`nDone -- published $i telemetry updates." -ForegroundColor Cyan
 }
