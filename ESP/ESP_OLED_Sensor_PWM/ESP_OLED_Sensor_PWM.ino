@@ -1,8 +1,8 @@
 /**
  * @file ESP_OLED_Sensor_PWM.ino
- * @brief Wemos D1 Mini (ESP8266) project reading DHT11 & Touch sensor,
- *        updating an I2C OLED display, and outputting temperature as a filtered analog voltage.
- * 
+ * @brief Wemos D1 Mini (ESP8266) - DHT11 & Touch sensor, SSD1306 OLED display,
+ *        MQ-135 air quality sensor, and a 1 kHz PWM analog output for temperature.
+ *
  * Hardware Connections:
  * - OLED display (SSD1306 128x64 I2C):
  *   - SDA -> D2 (GPIO4)
@@ -12,22 +12,41 @@
  * - DHT11 Temperature/Humidity Sensor:
  *   - DATA -> D5 (GPIO14) [D5 supports internal pull-up]
  * - Analog Temperature Output (via RC Low-Pass Filter):
- *   - D6 (GPIO12) used as PWM output
- *   - Filter: 2 kΩ resistor in series, 10 µF capacitor to GND
+ *   - D6 (GPIO12) used as PWM output at 1 kHz
+ *   - RC Filter: 2 kΩ resistor in series, 10 µF capacitor to GND
+ *     -> Cut-off freq fc ≈ 7.95 Hz, so 1 kHz PWM carrier is smoothed to a clean DC level.
  * - MQ-135 Gas Sensor:
  *   - Analog Out -> A0 (ADC0)
- * 
+ *
+ * PWM Architecture:
+ * - The PWM output has its OWN independent clock via the Ticker library.
+ *   The Ticker fires every PWM_APPLY_INTERVAL_MS (10 ms) to call analogWrite().
+ *   This is completely decoupled from sensor reads, OLED updates, and the main loop.
+ * - The 1 kHz carrier (hardware timer) runs continuously in background.
+ *   The Ticker only updates the duty cycle value at 100 Hz.
+ *
+ * PWM Calibration Curve (Temperature -> Duty Cycle -> Voltage after RC filter):
+ * - Linear mapping across the full DHT11 measurement range:
+ *     0°C  ->   0% duty cycle -> 0.00 V (DC after filter)
+ *    25°C  ->  50% duty cycle -> 1.65 V
+ *    50°C  -> 100% duty cycle -> 3.30 V
+ * - Formula: duty = (T_celsius / 50.0) * 1023
+ * - Inverse (LabVIEW side): T_celsius = V_measured * (50.0 / 3.3)
+ *   e.g. 1.65 V -> 25.0°C
+ *
  * Required Libraries:
  * - Adafruit SSD1306 (by Adafruit)
  * - Adafruit GFX Library (by Adafruit)
  * - DHT sensor library (by Adafruit)
  * - Adafruit Unified Sensor (dependency for DHT)
+ * - Ticker (built-in for ESP8266 Arduino core)
  */
 
 #include <Wire.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
 #include <DHT.h>
+#include <Ticker.h>
 
 // --- Configuration & Pin Definitions ---
 #define SCREEN_WIDTH 128     // OLED display width, in pixels
@@ -50,12 +69,42 @@
 #define PWM_OUT_PIN 12       // D6 (GPIO12)
 
 // PWM Constants
-#define PWM_FREQUENCY 1000   // 1 kHz (well above the ~8Hz cutoff of the 2k + 10uF filter)
-#define PWM_MAX_RANGE 1023   // 10-bit PWM range (0-1023)
+// analogWriteFreq sets the 1 kHz hardware carrier — runs independently via timer.
+// The Ticker updates the duty cycle register at 100 Hz (every 10 ms).
+#define PWM_FREQUENCY         1000   // 1 kHz PWM carrier frequency
+#define PWM_MAX_RANGE         1023   // 10-bit resolution (0 = 0%, 1023 = 100%)
+#define PWM_APPLY_INTERVAL_MS 10     // Ticker interval: 10 ms -> 100 Hz duty update rate
+
+// Calibration: DHT11 full measurement range mapped linearly to 0-100% duty cycle
+#define TEMP_MIN_C  0.0f             // 0°C  ->   0% duty ->  0.00 V after RC filter
+#define TEMP_MAX_C  50.0f            // 50°C -> 100% duty ->  3.30 V after RC filter
+// LabVIEW inverse: T_celsius = V_measured * (50.0 / 3.3)
 
 // Timing Constants
 const unsigned long DHT_UPDATE_INTERVAL = 2000; // Read DHT11 every 2 seconds
 const unsigned long MQ_UPDATE_INTERVAL = 500;    // Read MQ-135 every 500ms
+
+// =============================================================
+// PWM Task — Independent Ticker
+// =============================================================
+// targetPWMValue is written by the main loop sensor logic and read by the
+// Ticker callback. 'volatile' prevents the compiler caching it across the
+// ISR/main-loop boundary.
+volatile int targetPWMValue = 0;
+
+Ticker pwmTicker;
+
+/**
+ * @brief PWM Ticker callback — fires every PWM_APPLY_INTERVAL_MS (10 ms).
+ *
+ * Runs from the Ticker timer context, completely independent of loop().
+ * Applies the latest duty cycle so the 1 kHz square wave on D6 is always
+ * present, even when the main loop is blocked by I2C, DHT bit-banging, etc.
+ */
+void pwmApplyDuty() {
+  analogWrite(PWM_OUT_PIN, targetPWMValue);
+}
+
 
 // --- Object Initializations ---
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
@@ -68,7 +117,6 @@ unsigned long lastMQReadTime = 0;
 float currentHumidity = 0.0;
 float currentTemperature = 0.0;
 bool dhtReadingValid = false;
-int currentPWMValue = 0;
 
 float mqVoltage = 0.0;
 String aqState = "GOOD";
@@ -87,9 +135,15 @@ void setup() {
   pinMode(TOUCH_PIN, INPUT);
 
   // Configure PWM output pin (No pinMode call to avoid overriding software PWM setup)
-  analogWriteFreq(PWM_FREQUENCY);  // Set frequency suitable for RC low-pass filter
-  analogWriteRange(PWM_MAX_RANGE); // Configure range (0-1023)
-  analogWrite(PWM_OUT_PIN, 0);     // Start with 0V output
+  analogWriteFreq(PWM_FREQUENCY);  // Set 1 kHz carrier — hardware timer runs this continuously
+  analogWriteRange(PWM_MAX_RANGE); // 10-bit duty resolution (0-1023)
+  analogWrite(PWM_OUT_PIN, 0);     // Start at 0% duty -> 0 V
+
+  // Launch the independent PWM Ticker (fires every 10 ms = 100 Hz).
+  // From this point, pwmApplyDuty() owns all analogWrite() calls for D6.
+  // The main loop ONLY updates targetPWMValue — never calls analogWrite() on D6.
+  pwmTicker.attach_ms(PWM_APPLY_INTERVAL_MS, pwmApplyDuty);
+  Serial.println(F("PWM Ticker started: 1 kHz carrier, duty updated at 100 Hz"));
 
   // Initialize custom I2C pins for Wemos D1 Mini
   Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
@@ -135,17 +189,16 @@ void loop() {
     float hum = dht.readHumidity();
     float temp = dht.readTemperature();
 
-    // Check if readings are valid
     if (isnan(hum) || isnan(temp)) {
-      if (dhtReadingValid) { // Only trigger update if state changed
+      // Read failed: mark invalid for display, but HOLD the current duty cycle.
+      // Do NOT call analogWrite(0) here — that caused the "0V dropout" glitch.
+      // The Ticker keeps the last valid duty active until the next good reading.
+      if (dhtReadingValid) {
         dhtReadingValid = false;
         displayNeedsUpdate = true;
       }
-      Serial.println(F("Error: Failed to read from DHT11 sensor!"));
-      currentPWMValue = 0;
-      analogWrite(PWM_OUT_PIN, 0); // Force 0V output on error
+      Serial.println(F("Warning: DHT11 read failed — holding last PWM duty"));
     } else {
-      // Trigger display update if temperature or humidity changes
       if (!dhtReadingValid || currentTemperature != temp || currentHumidity != hum) {
         currentHumidity = hum;
         currentTemperature = temp;
@@ -153,13 +206,10 @@ void loop() {
         displayNeedsUpdate = true;
       }
 
-      // 3. Generate PWM signal proportional to Temperature
-      // Linear mapping: 20.0 C -> 1.5V, 35.0 C -> 3.3V
-      float constrainedTemp = constrain(currentTemperature, 20.0f, 35.0f);
-      float targetVoltage = 1.5f + (constrainedTemp - 20.0f) * ((3.3f - 1.5f) / (35.0f - 20.0f));
-      
-      currentPWMValue = (int)((targetVoltage / 3.3f) * PWM_MAX_RANGE);
-      analogWrite(PWM_OUT_PIN, currentPWMValue);
+      // Update duty cycle target — the Ticker applies it within the next 10 ms.
+      // NEVER call analogWrite() here; the Ticker owns D6 from setup() onward.
+      float constrainedTemp = constrain(currentTemperature, TEMP_MIN_C, TEMP_MAX_C);
+      targetPWMValue = (int)((constrainedTemp / TEMP_MAX_C) * (float)PWM_MAX_RANGE);
     }
   }
 
@@ -249,10 +299,13 @@ void loop() {
   if (currentMillis - lastLogTime >= 2000) {
     lastLogTime = currentMillis;
     if (dhtReadingValid) {
-      Serial.print(F("Hum: ")); Serial.print(currentHumidity); Serial.print(F("% | "));
-      Serial.print(F("Temp: ")); Serial.print(currentTemperature); Serial.print(F(" C | "));
-      Serial.print(F("PWM: ")); Serial.print(currentPWMValue); Serial.print(F(" ("));
-      Serial.print((currentPWMValue / 1023.0f) * 3.3f, 2); Serial.print(F("V) | "));
+      float pwmVoltage = (targetPWMValue / (float)PWM_MAX_RANGE) * 3.3f;
+      Serial.print(F("Temp: "));     Serial.print(currentTemperature, 1); Serial.print(F(" C | "));
+      Serial.print(F("Hum: "));      Serial.print(currentHumidity, 1);    Serial.print(F("% | "));
+      Serial.print(F("PWM duty: ")); Serial.print(targetPWMValue);
+      Serial.print(F("/1023 -> "));  Serial.print(pwmVoltage, 2);         Serial.print(F(" V | "));
+    } else {
+      Serial.print(F("DHT: ERR | "));
     }
     Serial.print(F("MQ-135: ")); Serial.print(mqVoltage, 2); Serial.print(F("V ("));
     Serial.print(aqState); Serial.print(F(") | "));
