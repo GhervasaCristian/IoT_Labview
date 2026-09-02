@@ -40,6 +40,15 @@
  * - DHT sensor library (by Adafruit)
  * - Adafruit Unified Sensor (dependency for DHT)
  * - Ticker (built-in for ESP8266 Arduino core)
+ * - PubSubClient (by Nick O'Leary) -- MQTT client for Home Assistant
+ * - ESP8266WiFi (built-in for ESP8266 Arduino core)
+ *
+ * Home Assistant / MQTT:
+ * - Publishes readings as one JSON state message on MQTT_STATE_TOPIC.
+ * - Publishes retained MQTT Discovery config messages on first connect, so
+ *   Home Assistant's "MQTT" integration auto-creates the entities below
+ *   (Settings -> Devices & Services -> MQTT -> the device appears automatically,
+ *   no manual entity/YAML setup needed).
  */
 
 #include <Wire.h>
@@ -47,6 +56,8 @@
 #include <Adafruit_SSD1306.h>
 #include <DHT.h>
 #include <Ticker.h>
+#include <ESP8266WiFi.h>
+#include <PubSubClient.h>
 
 // --- Configuration & Pin Definitions ---
 #define SCREEN_WIDTH 128     // OLED display width, in pixels
@@ -84,6 +95,24 @@
 const unsigned long DHT_UPDATE_INTERVAL = 2000; // Read DHT11 every 2 seconds
 const unsigned long MQ_UPDATE_INTERVAL = 500;    // Read MQ-135 every 500ms
 
+// --- WiFi & MQTT / Home Assistant Configuration ---
+const char* WIFI_SSID     = "YOUR_WIFI_SSID";     // TODO: set your WiFi network name
+const char* WIFI_PASSWORD = "YOUR_WIFI_PASSWORD"; // TODO: set your WiFi password
+
+const char* MQTT_BROKER    = "192.168.1.137"; // Mosquitto broker (runs alongside the HA docker container on this PC)
+const uint16_t MQTT_PORT   = 1883;
+const char* MQTT_USER      = "homeassistant";
+const char* MQTT_PASSWORD  = "YOUR_MQTT_PASSWORD"; // TODO: set the broker password (see setup notes, not committed to git)
+const char* MQTT_CLIENT_ID = "esp_oled_sensor_01";
+
+const char* DEVICE_ID    = "esp_oled_sensor_01";
+const char* DEVICE_NAME  = "ESP OLED Sensor";
+const char* MQTT_STATE_TOPIC = "esp_oled_sensor/state";
+
+const unsigned long WIFI_RETRY_INTERVAL_MS = 8000;
+const unsigned long MQTT_RETRY_INTERVAL_MS = 5000;
+const unsigned long MQTT_PUBLISH_INTERVAL_MS = 2000; // Publish state to HA every 2s
+
 // =============================================================
 // PWM Task — Independent Ticker
 // =============================================================
@@ -109,10 +138,16 @@ void pwmApplyDuty() {
 // --- Object Initializations ---
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 DHT dht(DHTPIN, DHTTYPE);
+WiFiClient espClient;
+PubSubClient mqttClient(espClient);
 
 // --- Global Variables for State Tracking ---
 unsigned long lastDHTReadTime = 0;
 unsigned long lastMQReadTime = 0;
+unsigned long lastWifiAttemptMs = 0;
+unsigned long lastMqttAttemptMs = 0;
+unsigned long lastMqttPublishMs = 0;
+bool mqttDiscoveryPublished = false;
 
 float currentHumidity = 0.0;
 float currentTemperature = 0.0;
@@ -124,6 +159,107 @@ bool lastTouchedState = false;
 
 // Flag to request an OLED update only when values change
 bool displayNeedsUpdate = true;
+
+// =============================================================
+// WiFi & MQTT / Home Assistant Discovery
+// =============================================================
+
+/**
+ * @brief Non-blocking WiFi connect/reconnect with backoff.
+ */
+void maintainWiFi() {
+  if (WiFi.status() == WL_CONNECTED) return;
+
+  unsigned long now = millis();
+  if (lastWifiAttemptMs != 0 && (now - lastWifiAttemptMs < WIFI_RETRY_INTERVAL_MS)) return;
+  lastWifiAttemptMs = now;
+
+  Serial.printf("[WiFi] Connecting to SSID: %s...\n", WIFI_SSID);
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+}
+
+/**
+ * @brief Publishes one retained MQTT Discovery config message so Home
+ * Assistant's MQTT integration auto-creates the entity. All entities share
+ * MQTT_STATE_TOPIC and pick their value out of the shared JSON payload.
+ */
+void publishDiscoveryConfig(const char* component, const char* objectId, const char* name,
+                             const char* deviceClass, const char* unit, const char* valueTemplate) {
+  char configTopic[128];
+  snprintf(configTopic, sizeof(configTopic), "homeassistant/%s/%s/%s/config", component, DEVICE_ID, objectId);
+
+  char payload[512];
+  int n = snprintf(payload, sizeof(payload),
+    "{\"name\":\"%s\",\"unique_id\":\"%s_%s\",\"state_topic\":\"%s\",\"value_template\":\"%s\"",
+    name, DEVICE_ID, objectId, MQTT_STATE_TOPIC, valueTemplate);
+
+  if (unit != nullptr) {
+    n += snprintf(payload + n, sizeof(payload) - n, ",\"unit_of_measurement\":\"%s\"", unit);
+  }
+  if (deviceClass != nullptr) {
+    n += snprintf(payload + n, sizeof(payload) - n, ",\"device_class\":\"%s\"", deviceClass);
+  }
+  snprintf(payload + n, sizeof(payload) - n,
+    ",\"device\":{\"identifiers\":[\"%s\"],\"name\":\"%s\",\"manufacturer\":\"DIY\",\"model\":\"Wemos D1 Mini ESP8266\"}}",
+    DEVICE_ID, DEVICE_NAME);
+
+  mqttClient.publish(configTopic, payload, true); // retained
+}
+
+void publishAllDiscoveryConfigs() {
+  publishDiscoveryConfig("sensor", "temperature", "Temperature", "temperature", "°C", "{{ value_json.temperature }}");
+  publishDiscoveryConfig("sensor", "humidity", "Humidity", "humidity", "%", "{{ value_json.humidity }}");
+  publishDiscoveryConfig("sensor", "mq135_voltage", "MQ-135 Voltage", "voltage", "V", "{{ value_json.mq_voltage }}");
+  publishDiscoveryConfig("sensor", "air_quality", "Air Quality", nullptr, nullptr, "{{ value_json.air_quality }}");
+  publishDiscoveryConfig("binary_sensor", "touch", "Touch Sensor", nullptr, nullptr, "{{ value_json.touch }}");
+  Serial.println(F("[MQTT] Discovery configs published to Home Assistant."));
+}
+
+/**
+ * @brief Non-blocking MQTT connect/reconnect with backoff; re-publishes
+ * discovery configs once after every fresh connection (retained, so this is
+ * cheap and keeps HA in sync if the broker/device state was ever cleared).
+ */
+void maintainMQTT() {
+  if (WiFi.status() != WL_CONNECTED) return;
+
+  if (!mqttClient.connected()) {
+    unsigned long now = millis();
+    if (lastMqttAttemptMs != 0 && (now - lastMqttAttemptMs < MQTT_RETRY_INTERVAL_MS)) return;
+    lastMqttAttemptMs = now;
+
+    Serial.print(F("[MQTT] Connecting to broker..."));
+    if (mqttClient.connect(MQTT_CLIENT_ID, MQTT_USER, MQTT_PASSWORD)) {
+      Serial.println(F("connected"));
+      mqttDiscoveryPublished = false;
+    } else {
+      Serial.printf("failed, rc=%d\n", mqttClient.state());
+      return;
+    }
+  }
+
+  mqttClient.loop();
+
+  if (!mqttDiscoveryPublished) {
+    publishAllDiscoveryConfigs();
+    mqttDiscoveryPublished = true;
+  }
+}
+
+/**
+ * @brief Publishes the current sensor readings as one JSON state message.
+ */
+void publishMqttState() {
+  if (!mqttClient.connected()) return;
+
+  char payload[256];
+  snprintf(payload, sizeof(payload),
+    "{\"temperature\":%.1f,\"humidity\":%.1f,\"mq_voltage\":%.2f,\"air_quality\":\"%s\",\"touch\":\"%s\"}",
+    currentTemperature, currentHumidity, mqVoltage, aqState.c_str(), lastTouchedState ? "ON" : "OFF");
+
+  mqttClient.publish(MQTT_STATE_TOPIC, payload);
+}
 
 void setup() {
   // Initialize Serial Monitor for debugging
@@ -159,6 +295,11 @@ void setup() {
   // Initialize DHT sensor
   dht.begin();
 
+  // Kick off WiFi + MQTT (non-blocking from here on; loop() maintains both)
+  maintainWiFi();
+  mqttClient.setServer(MQTT_BROKER, MQTT_PORT);
+  mqttClient.setBufferSize(512); // discovery config payloads exceed the 256-byte default
+
   // Initial display setup
   display.clearDisplay();
   display.setTextColor(SSD1306_WHITE);
@@ -171,6 +312,10 @@ void setup() {
 
 void loop() {
   unsigned long currentMillis = millis();
+
+  // 0. Keep WiFi & MQTT alive (both are non-blocking with their own backoff timers)
+  maintainWiFi();
+  maintainMQTT();
 
   // 1. Read Touch Sensor continuously (very fast digital read)
   int touchState = digitalRead(TOUCH_PIN);
@@ -294,7 +439,13 @@ void loop() {
     display.display();
   }
 
-  // 5. Debug logging to Serial Monitor every 2 seconds
+  // 5. Publish state to Home Assistant over MQTT every MQTT_PUBLISH_INTERVAL_MS
+  if (currentMillis - lastMqttPublishMs >= MQTT_PUBLISH_INTERVAL_MS) {
+    lastMqttPublishMs = currentMillis;
+    publishMqttState();
+  }
+
+  // 6. Debug logging to Serial Monitor every 2 seconds
   static unsigned long lastLogTime = 0;
   if (currentMillis - lastLogTime >= 2000) {
     lastLogTime = currentMillis;
