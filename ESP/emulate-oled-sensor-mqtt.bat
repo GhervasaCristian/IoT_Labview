@@ -3,20 +3,15 @@ REM Emulates the ThingsBoard telemetry ESP_OLED_Sensor_PWM.ino sends
 REM (a JSON telemetry message every ~2s), without the real ESP8266 board.
 REM Requires Docker Desktop running (uses the eclipse-mosquitto image's mosquitto_pub).
 REM
-REM Usage:
+REM Usage (token defaults to the ESP OLED Sensor demo device below -- pass one to override):
+REM   emulate-oled-sensor-mqtt.bat
 REM   emulate-oled-sensor-mqtt.bat YOUR_DEVICE_ACCESS_TOKEN
 REM   emulate-oled-sensor-mqtt.bat YOUR_DEVICE_ACCESS_TOKEN 192.168.100.223 1883
 REM   emulate-oled-sensor-mqtt.bat YOUR_DEVICE_ACCESS_TOKEN 192.168.100.223 1883 10
 REM     (4th arg = duration in seconds, e.g. 10 = publish every 2s for 10s then stop; omit to run forever)
 
-if "%~1"=="" (
-    echo Usage: %~nx0 ^<thingsboard_device_token^> [broker] [port] [duration_seconds]
-    echo   e.g.  %~nx0 A1B2C3D4E5F6G7H8I9J0
-    echo   e.g.  %~nx0 A1B2C3D4E5F6G7H8I9J0 192.168.100.223 1883 10
-    exit /b 1
-)
-
 set TB_TOKEN=%~1
+if "%TB_TOKEN%"=="" set TB_TOKEN=FuFDPgDZK2hBapYSq0Ra
 set TB_BROKER=%~2
 set TB_PORT=%~3
 set TB_DURATION=%~4
