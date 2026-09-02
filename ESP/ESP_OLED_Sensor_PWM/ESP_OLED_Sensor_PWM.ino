@@ -40,15 +40,16 @@
  * - DHT sensor library (by Adafruit)
  * - Adafruit Unified Sensor (dependency for DHT)
  * - Ticker (built-in for ESP8266 Arduino core)
- * - PubSubClient (by Nick O'Leary) -- MQTT client for Home Assistant
  * - ESP8266WiFi (built-in for ESP8266 Arduino core)
+ * - ThingsBoard Arduino SDK (thingsboard-client-sdk) -- ThingsBoard.h, Arduino_MQTT_Client.h
  *
- * Home Assistant / MQTT:
- * - Publishes readings as one JSON state message on MQTT_STATE_TOPIC.
- * - Publishes retained MQTT Discovery config messages on first connect, so
- *   Home Assistant's "MQTT" integration auto-creates the entities below
- *   (Settings -> Devices & Services -> MQTT -> the device appears automatically,
- *   no manual entity/YAML setup needed).
+ * ThingsBoard / IoT:
+ * - Same connectivity pattern as NFC_Reader_Debug.ino: WiFi + Arduino_MQTT_Client +
+ *   ThingsBoard MQTT telemetry, non-blocking connect/reconnect with backoff.
+ * - Publishes temperature, humidity, MQ-135 voltage, air quality classification, and
+ *   touch state as ThingsBoard telemetry every TB_PUBLISH_INTERVAL_MS.
+ * - Create a device in ThingsBoard for this sensor and set tbToken to its access token
+ *   before flashing (placeholder below, not committed with a real secret).
  */
 
 #include <Wire.h>
@@ -57,7 +58,10 @@
 #include <DHT.h>
 #include <Ticker.h>
 #include <ESP8266WiFi.h>
-#include <PubSubClient.h>
+#include <array>
+
+#include <Arduino_MQTT_Client.h>
+#include <ThingsBoard.h>
 
 // --- Configuration & Pin Definitions ---
 #define SCREEN_WIDTH 128     // OLED display width, in pixels
@@ -95,23 +99,20 @@
 const unsigned long DHT_UPDATE_INTERVAL = 2000; // Read DHT11 every 2 seconds
 const unsigned long MQ_UPDATE_INTERVAL = 500;    // Read MQ-135 every 500ms
 
-// --- WiFi & MQTT / Home Assistant Configuration ---
-const char* WIFI_SSID     = "YOUR_WIFI_SSID";     // TODO: set your WiFi network name
-const char* WIFI_PASSWORD = "YOUR_WIFI_PASSWORD"; // TODO: set your WiFi password
+// --- WiFi & ThingsBoard Configuration ---
+// Same pattern/config names as NFC_Reader_Debug.ino (known-working ThingsBoard setup).
+String tbWifiSsid = "YOUR_WIFI_SSID";     // TODO: set your WiFi network name
+String tbWifiPass = "YOUR_WIFI_PASSWORD"; // TODO: set your WiFi password
+String tbServer   = "192.168.100.223";    // Same ThingsBoard server as NFC_Reader_Debug.ino
+uint16_t tbPort   = 1883U;
+String tbToken    = "YOUR_OLED_SENSOR_DEVICE_TOKEN"; // TODO: access token of a NEW ThingsBoard device (do not reuse the NFC device's token)
 
-const char* MQTT_BROKER    = "192.168.1.137"; // Mosquitto broker (runs alongside the HA docker container on this PC)
-const uint16_t MQTT_PORT   = 1883;
-const char* MQTT_USER      = "homeassistant";
-const char* MQTT_PASSWORD  = "YOUR_MQTT_PASSWORD"; // TODO: set the broker password (see setup notes, not committed to git)
-const char* MQTT_CLIENT_ID = "esp_oled_sensor_01";
-
-const char* DEVICE_ID    = "esp_oled_sensor_01";
-const char* DEVICE_NAME  = "ESP OLED Sensor";
-const char* MQTT_STATE_TOPIC = "esp_oled_sensor/state";
+constexpr uint16_t MAX_MESSAGE_SEND_SIZE = 512U;
+constexpr uint16_t MAX_MESSAGE_RECEIVE_SIZE = 512U;
 
 const unsigned long WIFI_RETRY_INTERVAL_MS = 8000;
-const unsigned long MQTT_RETRY_INTERVAL_MS = 5000;
-const unsigned long MQTT_PUBLISH_INTERVAL_MS = 2000; // Publish state to HA every 2s
+const unsigned long TB_RETRY_INTERVAL_MS = 5000;
+const unsigned long TB_PUBLISH_INTERVAL_MS = 2000; // Publish telemetry to ThingsBoard every 2s
 
 // =============================================================
 // PWM Task — Independent Ticker
@@ -138,16 +139,18 @@ void pwmApplyDuty() {
 // --- Object Initializations ---
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 DHT dht(DHTPIN, DHTTYPE);
+
 WiFiClient espClient;
-PubSubClient mqttClient(espClient);
+Arduino_MQTT_Client mqttClient(espClient);
+const std::array<IAPI_Implementation*, 0U> apis = {};
+ThingsBoard tb(mqttClient, MAX_MESSAGE_RECEIVE_SIZE, MAX_MESSAGE_SEND_SIZE, Default_Max_Stack_Size, apis);
 
 // --- Global Variables for State Tracking ---
 unsigned long lastDHTReadTime = 0;
 unsigned long lastMQReadTime = 0;
 unsigned long lastWifiAttemptMs = 0;
-unsigned long lastMqttAttemptMs = 0;
-unsigned long lastMqttPublishMs = 0;
-bool mqttDiscoveryPublished = false;
+unsigned long lastTbAttemptMs = 0;
+unsigned long lastTbPublishMs = 0;
 
 float currentHumidity = 0.0;
 float currentTemperature = 0.0;
@@ -161,7 +164,7 @@ bool lastTouchedState = false;
 bool displayNeedsUpdate = true;
 
 // =============================================================
-// WiFi & MQTT / Home Assistant Discovery
+// WiFi & ThingsBoard Connection Management
 // =============================================================
 
 /**
@@ -174,91 +177,52 @@ void maintainWiFi() {
   if (lastWifiAttemptMs != 0 && (now - lastWifiAttemptMs < WIFI_RETRY_INTERVAL_MS)) return;
   lastWifiAttemptMs = now;
 
-  Serial.printf("[WiFi] Connecting to SSID: %s...\n", WIFI_SSID);
+  Serial.printf("[WiFi] Connecting to SSID: %s...\n", tbWifiSsid.c_str());
   WiFi.mode(WIFI_STA);
-  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  WiFi.begin(tbWifiSsid.c_str(), tbWifiPass.c_str());
 }
 
 /**
- * @brief Publishes one retained MQTT Discovery config message so Home
- * Assistant's MQTT integration auto-creates the entity. All entities share
- * MQTT_STATE_TOPIC and pick their value out of the shared JSON payload.
+ * @brief Non-blocking ThingsBoard connect/reconnect with backoff, mirroring
+ * checkIoTConnection() in NFC_Reader_Debug.ino.
  */
-void publishDiscoveryConfig(const char* component, const char* objectId, const char* name,
-                             const char* deviceClass, const char* unit, const char* valueTemplate) {
-  char configTopic[128];
-  snprintf(configTopic, sizeof(configTopic), "homeassistant/%s/%s/%s/config", component, DEVICE_ID, objectId);
-
-  char payload[512];
-  int n = snprintf(payload, sizeof(payload),
-    "{\"name\":\"%s\",\"unique_id\":\"%s_%s\",\"state_topic\":\"%s\",\"value_template\":\"%s\"",
-    name, DEVICE_ID, objectId, MQTT_STATE_TOPIC, valueTemplate);
-
-  if (unit != nullptr) {
-    n += snprintf(payload + n, sizeof(payload) - n, ",\"unit_of_measurement\":\"%s\"", unit);
+void checkIoTConnection() {
+  if (WiFi.status() != WL_CONNECTED) {
+    maintainWiFi();
+    return;
   }
-  if (deviceClass != nullptr) {
-    n += snprintf(payload + n, sizeof(payload) - n, ",\"device_class\":\"%s\"", deviceClass);
+
+  if (tb.connected()) {
+    tb.loop();
+    return;
   }
-  snprintf(payload + n, sizeof(payload) - n,
-    ",\"device\":{\"identifiers\":[\"%s\"],\"name\":\"%s\",\"manufacturer\":\"DIY\",\"model\":\"Wemos D1 Mini ESP8266\"}}",
-    DEVICE_ID, DEVICE_NAME);
 
-  mqttClient.publish(configTopic, payload, true); // retained
-}
+  unsigned long now = millis();
+  if (lastTbAttemptMs != 0 && (now - lastTbAttemptMs < TB_RETRY_INTERVAL_MS)) return;
+  lastTbAttemptMs = now;
 
-void publishAllDiscoveryConfigs() {
-  publishDiscoveryConfig("sensor", "temperature", "Temperature", "temperature", "°C", "{{ value_json.temperature }}");
-  publishDiscoveryConfig("sensor", "humidity", "Humidity", "humidity", "%", "{{ value_json.humidity }}");
-  publishDiscoveryConfig("sensor", "mq135_voltage", "MQ-135 Voltage", "voltage", "V", "{{ value_json.mq_voltage }}");
-  publishDiscoveryConfig("sensor", "air_quality", "Air Quality", nullptr, nullptr, "{{ value_json.air_quality }}");
-  publishDiscoveryConfig("binary_sensor", "touch", "Touch Sensor", nullptr, nullptr, "{{ value_json.touch }}");
-  Serial.println(F("[MQTT] Discovery configs published to Home Assistant."));
+  Serial.printf("[ThingsBoard] Connecting to %s:%u (token %s)...\n",
+    tbServer.c_str(), tbPort, tbToken.c_str());
+
+  if (!tb.connect(tbServer.c_str(), tbToken.c_str(), tbPort)) {
+    Serial.println(F("[ThingsBoard] Connection failed (will retry)."));
+    return;
+  }
+
+  Serial.println(F("[ThingsBoard] Connected successfully!"));
 }
 
 /**
- * @brief Non-blocking MQTT connect/reconnect with backoff; re-publishes
- * discovery configs once after every fresh connection (retained, so this is
- * cheap and keeps HA in sync if the broker/device state was ever cleared).
+ * @brief Publishes the current sensor readings as ThingsBoard telemetry.
  */
-void maintainMQTT() {
-  if (WiFi.status() != WL_CONNECTED) return;
+void publishTelemetry() {
+  if (!tb.connected()) return;
 
-  if (!mqttClient.connected()) {
-    unsigned long now = millis();
-    if (lastMqttAttemptMs != 0 && (now - lastMqttAttemptMs < MQTT_RETRY_INTERVAL_MS)) return;
-    lastMqttAttemptMs = now;
-
-    Serial.print(F("[MQTT] Connecting to broker..."));
-    if (mqttClient.connect(MQTT_CLIENT_ID, MQTT_USER, MQTT_PASSWORD)) {
-      Serial.println(F("connected"));
-      mqttDiscoveryPublished = false;
-    } else {
-      Serial.printf("failed, rc=%d\n", mqttClient.state());
-      return;
-    }
-  }
-
-  mqttClient.loop();
-
-  if (!mqttDiscoveryPublished) {
-    publishAllDiscoveryConfigs();
-    mqttDiscoveryPublished = true;
-  }
-}
-
-/**
- * @brief Publishes the current sensor readings as one JSON state message.
- */
-void publishMqttState() {
-  if (!mqttClient.connected()) return;
-
-  char payload[256];
-  snprintf(payload, sizeof(payload),
-    "{\"temperature\":%.1f,\"humidity\":%.1f,\"mq_voltage\":%.2f,\"air_quality\":\"%s\",\"touch\":\"%s\"}",
-    currentTemperature, currentHumidity, mqVoltage, aqState.c_str(), lastTouchedState ? "ON" : "OFF");
-
-  mqttClient.publish(MQTT_STATE_TOPIC, payload);
+  tb.sendTelemetryData("temperature", currentTemperature);
+  tb.sendTelemetryData("humidity", currentHumidity);
+  tb.sendTelemetryData("mq_voltage", mqVoltage);
+  tb.sendTelemetryData("air_quality", aqState.c_str());
+  tb.sendTelemetryData("touch", lastTouchedState);
 }
 
 void setup() {
@@ -295,10 +259,8 @@ void setup() {
   // Initialize DHT sensor
   dht.begin();
 
-  // Kick off WiFi + MQTT (non-blocking from here on; loop() maintains both)
+  // Kick off WiFi + ThingsBoard (non-blocking from here on; loop() maintains both)
   maintainWiFi();
-  mqttClient.setServer(MQTT_BROKER, MQTT_PORT);
-  mqttClient.setBufferSize(512); // discovery config payloads exceed the 256-byte default
 
   // Initial display setup
   display.clearDisplay();
@@ -313,14 +275,13 @@ void setup() {
 void loop() {
   unsigned long currentMillis = millis();
 
-  // 0. Keep WiFi & MQTT alive (both are non-blocking with their own backoff timers)
-  maintainWiFi();
-  maintainMQTT();
+  // 0. Keep WiFi & ThingsBoard alive (both are non-blocking with their own backoff timers)
+  checkIoTConnection();
 
   // 1. Read Touch Sensor continuously (very fast digital read)
   int touchState = digitalRead(TOUCH_PIN);
   bool isTouched = (touchState == HIGH);
-  
+
   // Trigger display update immediately if the touch state changes
   if (isTouched != lastTouchedState) {
     lastTouchedState = isTouched;
@@ -439,10 +400,10 @@ void loop() {
     display.display();
   }
 
-  // 5. Publish state to Home Assistant over MQTT every MQTT_PUBLISH_INTERVAL_MS
-  if (currentMillis - lastMqttPublishMs >= MQTT_PUBLISH_INTERVAL_MS) {
-    lastMqttPublishMs = currentMillis;
-    publishMqttState();
+  // 5. Publish telemetry to ThingsBoard every TB_PUBLISH_INTERVAL_MS
+  if (currentMillis - lastTbPublishMs >= TB_PUBLISH_INTERVAL_MS) {
+    lastTbPublishMs = currentMillis;
+    publishTelemetry();
   }
 
   // 6. Debug logging to Serial Monitor every 2 seconds
@@ -461,5 +422,8 @@ void loop() {
     Serial.print(F("MQ-135: ")); Serial.print(mqVoltage, 2); Serial.print(F("V ("));
     Serial.print(aqState); Serial.print(F(") | "));
     Serial.print(F("Touch: ")); Serial.println(isTouched ? F("ON") : F("OFF"));
+    Serial.printf("WiFi: %s | ThingsBoard: %s\n",
+      WiFi.status() == WL_CONNECTED ? "CONNECTED" : "DISCONNECTED",
+      tb.connected() ? "ONLINE" : "OFFLINE");
   }
 }
