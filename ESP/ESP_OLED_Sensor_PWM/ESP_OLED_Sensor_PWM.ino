@@ -101,11 +101,11 @@ const unsigned long MQ_UPDATE_INTERVAL = 500;    // Read MQ-135 every 500ms
 
 // --- WiFi & ThingsBoard Configuration ---
 // Same pattern/config names as NFC_Reader_Debug.ino (known-working ThingsBoard setup).
-String tbWifiSsid = "YOUR_WIFI_SSID";     // TODO: set your WiFi network name
-String tbWifiPass = "YOUR_WIFI_PASSWORD"; // TODO: set your WiFi password
+String tbWifiSsid = "IoT Server1";     // TODO: set your WiFi network name
+String tbWifiPass = "Floridemar3"; // TODO: set your WiFi password
 String tbServer   = "192.168.100.223";    // Same ThingsBoard server as NFC_Reader_Debug.ino
 uint16_t tbPort   = 1883U;
-String tbToken    = "YOUR_OLED_SENSOR_DEVICE_TOKEN"; // TODO: access token of a NEW ThingsBoard device (do not reuse the NFC device's token)
+String tbToken    = "FuFDPgDZK2hBapYSq0Ra"; 
 
 constexpr uint16_t MAX_MESSAGE_SEND_SIZE = 512U;
 constexpr uint16_t MAX_MESSAGE_RECEIVE_SIZE = 512U;
