@@ -7,6 +7,7 @@ goto :eof
 #>
 
 # ============================================================================
+# https://arduino.esp8266.com/stable/package_esp8266com_index.json
 # Emulates the ThingsBoard telemetry ESP_OLED_Sensor_PWM.ino sends
 # (temperature, humidity, mq_voltage, air_quality, touch), without the real
 # ESP8266/OLED/DHT11/MQ-135 hardware connected. Same values, same telemetry
